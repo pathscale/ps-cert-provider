@@ -1,6 +1,6 @@
-# cert-provider
+# ps-cert-provider
 
-`cert-provider` is a Rust library crate that provides a unified, async interface for automatic TLS certificate provisioning and renewal using the ACME protocol. It abstracts over two popular ACME backends, allowing you to embed "certbot-like" functionality entirely within your application.
+`ps-cert-provider` is a Rust library crate that provides a unified, async interface for automatic TLS certificate provisioning and renewal using the ACME protocol. It abstracts over two popular ACME backends, allowing you to embed "certbot-like" functionality entirely within your application.
 
 The crate guarantees that valid certificate and key files are present in a given directory before your TLS server starts, and keeps them renewed for as long as you hold onto the returned guard.
 
@@ -24,13 +24,13 @@ The crate guarantees that valid certificate and key files are present in a given
 
 ```toml
 [dependencies]
-cert-provider = { version = "0.1", features = ["tokio-acme"] }
+cert-provider = { package = "ps-cert-provider", version = "0.1", features = ["tokio-acme"] }
 # or
-cert-provider = { version = "0.1", features = ["rfc8555"] }
+cert-provider = { package = "ps-cert-provider", version = "0.1", features = ["rfc8555"] }
 # or
-cert-provider = { version = "0.1", features = ["dns01"] }
+cert-provider = { package = "ps-cert-provider", version = "0.1", features = ["dns01"] }
 # or (with S3 sync)
-cert-provider = { version = "0.1", features = ["dns01", "s3-sync"] }
+cert-provider = { package = "ps-cert-provider", version = "0.1", features = ["dns01", "s3-sync"] }
 ```
 
 ---
