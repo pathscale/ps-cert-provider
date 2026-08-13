@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -7,8 +8,8 @@ use hyper_rustls::HttpsConnectorBuilder;
 use hyper_util::client::legacy::Client as HyperClient;
 use hyper_util::rt::TokioExecutor;
 use instant_acme::{
-    Account, AccountCredentials, AuthorizationStatus, BodyWrapper, ChallengeType,
-    HttpClient, Identifier, LetsEncrypt, NewAccount, NewOrder, OrderStatus, RetryPolicy,
+    Account, AccountCredentials, AuthorizationStatus, BodyWrapper, ChallengeType, HttpClient,
+    Identifier, LetsEncrypt, NewAccount, NewOrder, OrderStatus, RetryPolicy,
 };
 use rcgen::{CertificateParams, DistinguishedName, KeyPair};
 use serde::{Deserialize, Serialize};
@@ -54,12 +55,24 @@ fn make_http_client() -> Result<Box<dyn HttpClient>> {
 /// and the TXT record value (the ACME key authorisation digest).
 #[async_trait]
 pub trait DnsProvider: Send + Sync + 'static {
+    /// Remove TXT records left by previous interrupted challenges at this name.
+    ///
+    /// Providers that cannot list records may keep the default no-op. This is
+    /// called once per unique challenge name before a new TXT record is added.
+    async fn cleanup_txt_records(&self, _fqdn: &str) -> Result<()> {
+        Ok(())
+    }
+
     async fn add_txt_record(&self, fqdn: &str, value: &str) -> Result<()>;
     async fn remove_txt_record(&self, fqdn: &str, value: &str) -> Result<()>;
 }
 
 #[async_trait]
 impl<T: DnsProvider> DnsProvider for Arc<T> {
+    async fn cleanup_txt_records(&self, fqdn: &str) -> Result<()> {
+        self.as_ref().cleanup_txt_records(fqdn).await
+    }
+
     async fn add_txt_record(&self, fqdn: &str, value: &str) -> Result<()> {
         self.as_ref().add_txt_record(fqdn, value).await
     }
@@ -90,6 +103,8 @@ struct BunnyZoneList {
 #[serde(rename_all = "PascalCase")]
 struct BunnyRecord {
     id: u64,
+    #[serde(rename = "Type")]
+    record_type: u8,
     name: String,
     value: String,
 }
@@ -136,7 +151,11 @@ impl BunnyDns {
         let parts: Vec<&str> = name.split('.').collect();
         for i in 0..parts.len().saturating_sub(1) {
             let candidate = parts[i..].join(".");
-            let url = format!("{}/dnszone?search={}&page=1&perPage=10", self.base(), candidate);
+            let url = format!(
+                "{}/dnszone?search={}&page=1&perPage=10",
+                self.base(),
+                candidate
+            );
             let resp = self
                 .client
                 .get(&url)
@@ -144,13 +163,16 @@ impl BunnyDns {
                 .header("accept", "application/json")
                 .send()
                 .await
-                .map_err(|e| Error::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))?;
+                .map_err(|e| Error::Io(std::io::Error::other(e.to_string())))?;
 
             if !resp.status().is_success() {
                 continue;
             }
             let list: BunnyZoneList = resp.json().await.map_err(|e| {
-                Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))
+                Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    e.to_string(),
+                ))
             })?;
             for zone in list.items {
                 if name.ends_with(&zone.domain) {
@@ -169,10 +191,83 @@ impl BunnyDns {
             .or_else(|| name.strip_suffix(zone_domain))
             .unwrap_or(name)
     }
+
+    async fn records(&self, zone_id: u64) -> Result<Vec<BunnyRecord>> {
+        let url = format!("{}/dnszone/{zone_id}", self.base());
+        let resp = self
+            .client
+            .get(&url)
+            .header("AccessKey", &self.api_key)
+            .header("accept", "application/json")
+            .send()
+            .await
+            .map_err(|e| Error::Io(std::io::Error::other(e.to_string())))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            return Err(Error::Config(format!(
+                "bunny.net: fetch zone failed ({status})"
+            )));
+        }
+
+        let detail: BunnyZoneDetail = resp.json().await.map_err(|e| {
+            Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                e.to_string(),
+            ))
+        })?;
+        Ok(detail.dns_records)
+    }
+
+    async fn delete_record(&self, zone_id: u64, record_id: u64) -> Result<()> {
+        let url = format!("{}/dnszone/{zone_id}/records/{record_id}", self.base());
+        let resp = self
+            .client
+            .delete(&url)
+            .header("AccessKey", &self.api_key)
+            .send()
+            .await
+            .map_err(|e| Error::Io(std::io::Error::other(e.to_string())))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            return Err(Error::Config(format!(
+                "bunny.net: delete record {record_id} failed ({status})"
+            )));
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
 impl DnsProvider for BunnyDns {
+    async fn cleanup_txt_records(&self, fqdn: &str) -> Result<()> {
+        let (zone_id, zone_domain) = self.find_zone(fqdn).await?;
+        let record_name = self.relative_name(fqdn, &zone_domain);
+        let records = self.records(zone_id).await?;
+
+        let conflicts: Vec<String> = records
+            .iter()
+            .filter(|record| record.name == record_name && record.record_type != 3)
+            .map(|record| format!("id={} type={}", record.id, record.record_type))
+            .collect();
+        if !conflicts.is_empty() {
+            return Err(Error::Config(format!(
+                "bunny.net: non-TXT record conflicts with {fqdn}: {}",
+                conflicts.join(", ")
+            )));
+        }
+
+        for record in records
+            .iter()
+            .filter(|record| record.name == record_name && record.record_type == 3)
+        {
+            self.delete_record(zone_id, record.id).await?;
+            tracing::debug!(record_id = record.id, "bunny.net: removed stale TXT {fqdn}");
+        }
+        Ok(())
+    }
+
     async fn add_txt_record(&self, fqdn: &str, value: &str) -> Result<()> {
         let (zone_id, zone_domain) = self.find_zone(fqdn).await?;
         let record_name = self.relative_name(fqdn, &zone_domain);
@@ -193,7 +288,7 @@ impl DnsProvider for BunnyDns {
             .json(&body)
             .send()
             .await
-            .map_err(|e| Error::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))?;
+            .map_err(|e| Error::Io(std::io::Error::other(e.to_string())))?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -209,50 +304,23 @@ impl DnsProvider for BunnyDns {
     async fn remove_txt_record(&self, fqdn: &str, value: &str) -> Result<()> {
         let (zone_id, zone_domain) = self.find_zone(fqdn).await?;
         let record_name = self.relative_name(fqdn, &zone_domain);
+        let records = self.records(zone_id).await?;
+        let matching: Vec<&BunnyRecord> = records
+            .iter()
+            .filter(|record| {
+                record.record_type == 3 && record.name == record_name && record.value == value
+            })
+            .collect();
 
-        let url = format!("{}/dnszone/{zone_id}", self.base());
-        let resp = self
-            .client
-            .get(&url)
-            .header("AccessKey", &self.api_key)
-            .header("accept", "application/json")
-            .send()
-            .await
-            .map_err(|e| Error::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            return Err(Error::Config(format!(
-                "bunny.net: fetch zone failed ({status})"
-            )));
+        if matching.is_empty() {
+            warn!("bunny.net: TXT record {fqdn}={value} not found for cleanup");
+            return Ok(());
         }
 
-        let detail: BunnyZoneDetail = resp.json().await.map_err(|e| {
-            Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))
-        })?;
-
-        for record in detail.dns_records {
-            if record.name == record_name && record.value == value {
-                let del_url = format!("{}/dnszone/{zone_id}/records/{}", self.base(), record.id);
-                let del_resp = self
-                    .client
-                    .delete(&del_url)
-                    .header("AccessKey", &self.api_key)
-                    .send()
-                    .await
-                    .map_err(|e| {
-                        Error::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
-                    })?;
-                if del_resp.status().is_success() {
-                    tracing::debug!("bunny.net: removed TXT {fqdn} (id={})", record.id);
-                } else {
-                    let status = del_resp.status();
-                    warn!("bunny.net: delete record {} failed ({status})", record.id);
-                }
-                return Ok(());
-            }
+        for record in matching {
+            self.delete_record(zone_id, record.id).await?;
+            tracing::debug!("bunny.net: removed TXT {fqdn} (id={})", record.id);
         }
-        warn!("bunny.net: TXT record {fqdn}={value} not found for cleanup");
         Ok(())
     }
 }
@@ -323,8 +391,7 @@ async fn load_or_create_account(
 // ---------------------------------------------------------------------------
 
 fn generate_csr(domains: &[String]) -> Result<(Vec<u8>, Vec<u8>)> {
-    let key_pair = KeyPair::generate()
-        .map_err(|e| Error::Config(format!("CSR key gen: {e}")))?;
+    let key_pair = KeyPair::generate().map_err(|e| Error::Config(format!("CSR key gen: {e}")))?;
 
     let mut params = CertificateParams::new(domains.to_vec())
         .map_err(|e| Error::Config(format!("CSR params: {e}")))?;
@@ -346,8 +413,8 @@ fn generate_csr(domains: &[String]) -> Result<(Vec<u8>, Vec<u8>)> {
 fn read_cert_not_after(fullchain_path: &Path) -> Result<SystemTime> {
     let pem_bytes = std::fs::read(fullchain_path).map_err(Error::Io)?;
 
-    let (_, pem) = parse_x509_pem(&pem_bytes)
-        .map_err(|e| Error::Config(format!("cert PEM parse: {e}")))?;
+    let (_, pem) =
+        parse_x509_pem(&pem_bytes).map_err(|e| Error::Config(format!("cert PEM parse: {e}")))?;
 
     let (_, cert) = X509Certificate::from_der(&pem.contents)
         .map_err(|e| Error::Config(format!("cert DER parse: {e}")))?;
@@ -375,6 +442,47 @@ async fn issue_certificate<D: DnsProvider>(
     propagation_secs: u64,
     cert_dir: &Path,
 ) -> Result<()> {
+    let mut challenge_info = Vec::new();
+    let result = issue_certificate_inner(
+        dns,
+        account,
+        domains,
+        propagation_secs,
+        cert_dir,
+        &mut challenge_info,
+    )
+    .await;
+
+    finish_challenge_attempt(dns, &challenge_info, result).await
+}
+
+async fn finish_challenge_attempt<D: DnsProvider, T>(
+    dns: &D,
+    challenge_info: &[ChallengeInfo],
+    result: Result<T>,
+) -> Result<T> {
+    for challenge in challenge_info {
+        if let Err(error) = dns
+            .remove_txt_record(&challenge.fqdn, &challenge.dns_value)
+            .await
+        {
+            warn!(
+                "Failed to remove TXT record {} after ACME attempt: {error}",
+                challenge.fqdn
+            );
+        }
+    }
+    result
+}
+
+async fn issue_certificate_inner<D: DnsProvider>(
+    dns: &D,
+    account: &Account,
+    domains: &[String],
+    propagation_secs: u64,
+    cert_dir: &Path,
+    challenge_info: &mut Vec<ChallengeInfo>,
+) -> Result<()> {
     let identifiers: Vec<Identifier> = domains.iter().map(|d| Identifier::Dns(d.clone())).collect();
     let mut order = account
         .new_order(&NewOrder::new(&identifiers))
@@ -382,7 +490,7 @@ async fn issue_certificate<D: DnsProvider>(
         .map_err(|e| Error::AcmeProtocol(e.to_string()))?;
 
     // Phase 1: iterate authorizations and add TXT records
-    let mut challenge_info: Vec<ChallengeInfo> = Vec::new();
+    let mut cleaned_fqdns = HashSet::new();
     {
         let mut authorizations = order.authorizations();
         while let Some(authz_result) = authorizations.next().await {
@@ -405,6 +513,9 @@ async fn issue_certificate<D: DnsProvider>(
             let dns_value = key_auth.dns_value();
             let fqdn = format!("_acme-challenge.{domain}");
 
+            if cleaned_fqdns.insert(fqdn.clone()) {
+                dns.cleanup_txt_records(&fqdn).await?;
+            }
             dns.add_txt_record(&fqdn, &dns_value).await?;
             challenge_info.push(ChallengeInfo { fqdn, dns_value });
         }
@@ -412,10 +523,7 @@ async fn issue_certificate<D: DnsProvider>(
 
     // Wait for DNS propagation
     if !challenge_info.is_empty() {
-        tracing::debug!(
-            "DNS-01: waiting {}s for TXT propagation",
-            propagation_secs
-        );
+        tracing::debug!("DNS-01: waiting {}s for TXT propagation", propagation_secs);
         sleep(Duration::from_secs(propagation_secs)).await;
     }
 
@@ -449,13 +557,6 @@ async fn issue_certificate<D: DnsProvider>(
         .map_err(|e| Error::AcmeProtocol(e.to_string()))?;
 
     if order_status != OrderStatus::Ready {
-        // Best-effort cleanup of TXT records before returning the error
-        for ci in &challenge_info {
-            if let Err(e) = dns.remove_txt_record(&ci.fqdn, &ci.dns_value).await {
-                warn!("Failed to remove TXT record {}: {e}", ci.fqdn);
-            }
-        }
-
         // Prefer the order-level error detail, but if empty, probe individual
         // authorizations for challenge-level error information.
         let order_error = order.state().error.clone();
@@ -471,18 +572,16 @@ async fn issue_certificate<D: DnsProvider>(
                             if state.status == AuthorizationStatus::Invalid {
                                 for challenge in &state.challenges {
                                     if let Some(ref err) = challenge.error {
-                                        authz_errors.push(format!(
-                                            "{}: {err}",
-                                            state.identifier(),
-                                        ));
+                                        authz_errors
+                                            .push(format!("{}: {err}", state.identifier(),));
                                     }
                                 }
                             }
                         }
                     }
-                    Err(e) => authz_errors.push(format!(
-                        "failed to query authorization state: {e}"
-                    )),
+                    Err(e) => {
+                        authz_errors.push(format!("failed to query authorization state: {e}"))
+                    }
                 }
             }
             if authz_errors.is_empty() {
@@ -517,13 +616,6 @@ async fn issue_certificate<D: DnsProvider>(
     tokio::fs::write(&privkey_path, &key_pem).await?;
     info!("DNS-01 certificate written to {:?}", cert_dir);
 
-    // Cleanup TXT records (best-effort)
-    for ci in &challenge_info {
-        if let Err(e) = dns.remove_txt_record(&ci.fqdn, &ci.dns_value).await {
-            warn!("Failed to remove TXT record {}: {e}", ci.fqdn);
-        }
-    }
-
     Ok(())
 }
 
@@ -541,7 +633,11 @@ async fn issue_certificate<D: DnsProvider>(
 /// ```no_run
 /// use cert_provider::provider::dns01::{DnsAcmeProvider, BunnyDns};
 /// use cert_provider::provider::CertProvider;
+/// use std::path::PathBuf;
 ///
+/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+/// let cert_dir = PathBuf::from("/data/certs");
+/// let domains = vec!["example.com".to_owned()];
 /// let dns = BunnyDns::new(std::env::var("BUNNY_API_KEY").unwrap());
 /// let mut provider = DnsAcmeProvider::new("admin@example.com", dns)
 ///     .production()
@@ -549,6 +645,8 @@ async fn issue_certificate<D: DnsProvider>(
 ///     .max_retries(3);
 ///
 /// let _guard = provider.init(cert_dir, Some(domains)).await?;
+/// # Ok(())
+/// # }
 /// ```
 pub struct DnsAcmeProvider<D: DnsProvider> {
     contact_email: String,
@@ -655,7 +753,8 @@ impl<D: DnsProvider> CertProvider for DnsAcmeProvider<D> {
 
         // Issue cert if missing
         if !fullchain_path.exists() || !privkey_path.exists() {
-            let account = load_or_create_account(&cache_dir, &self.contact_email, self.production).await?;
+            let account =
+                load_or_create_account(&cache_dir, &self.contact_email, self.production).await?;
 
             // Persist credentials to S3 immediately — don't wait for the
             // retry loop to finish, or the account could be lost on crash.
@@ -685,7 +784,8 @@ impl<D: DnsProvider> CertProvider for DnsAcmeProvider<D> {
                         break;
                     }
                     Err(Error::Challenge(e)) if remaining > 0 => {
-                        let delay = self.propagation_secs * (self.max_retries - remaining + 1) as u64;
+                        let delay =
+                            self.propagation_secs * (self.max_retries - remaining + 1) as u64;
                         tracing::debug!(
                             "DNS-01 challenge failed ({e}), retrying in {delay}s ({remaining} retries left)"
                         );
@@ -729,15 +829,16 @@ impl<D: DnsProvider> CertProvider for DnsAcmeProvider<D> {
                 let sleep_until = match next_renewal {
                     Ok(not_after) => {
                         retry_delay = Duration::from_secs(3600);
-                        let renew_at = not_after
-                            .checked_sub(bg_renew_within)
-                            .unwrap_or(not_after);
+                        let renew_at = not_after.checked_sub(bg_renew_within).unwrap_or(not_after);
                         renew_at
                             .duration_since(SystemTime::now())
                             .unwrap_or(Duration::ZERO)
                     }
                     Err(e) => {
-                        tracing::debug!("Failed to read cert expiry: {e}, retrying in {:?}", retry_delay);
+                        tracing::debug!(
+                            "Failed to read cert expiry: {e}, retrying in {:?}",
+                            retry_delay
+                        );
                         let d = retry_delay;
                         retry_delay = (retry_delay * 2).min(Duration::from_secs(86400));
                         d
@@ -755,22 +856,28 @@ impl<D: DnsProvider> CertProvider for DnsAcmeProvider<D> {
                 }
 
                 // Re-load account (refreshed from cache each time)
-                let account = match load_or_create_account(&bg_cache_dir, &contact_email, production).await {
-                    Ok(a) => a,
-                    Err(e) => {
-                        tracing::debug!("Renewal: account load failed ({e}), retrying in {:?}", retry_delay);
-                        tokio::select! {
-                            biased;
-                            _ = bg_cancel.cancelled() => return,
-                            _ = sleep(retry_delay) => {}
+                let account =
+                    match load_or_create_account(&bg_cache_dir, &contact_email, production).await {
+                        Ok(a) => a,
+                        Err(e) => {
+                            tracing::debug!(
+                                "Renewal: account load failed ({e}), retrying in {:?}",
+                                retry_delay
+                            );
+                            tokio::select! {
+                                biased;
+                                _ = bg_cancel.cancelled() => return,
+                                _ = sleep(retry_delay) => {}
+                            }
+                            retry_delay = (retry_delay * 2).min(Duration::from_secs(86400));
+                            continue;
                         }
-                        retry_delay = (retry_delay * 2).min(Duration::from_secs(86400));
-                        continue;
-                    }
-                };
+                    };
 
                 // Attempt renewal
-                match issue_certificate(&dns, &account, &bg_domains, propagation_secs, &bg_cert_dir).await {
+                match issue_certificate(&dns, &account, &bg_domains, propagation_secs, &bg_cert_dir)
+                    .await
+                {
                     Ok(()) => {
                         tracing::debug!("DNS-01 certificate renewed successfully");
                         retry_delay = Duration::from_secs(3600);
@@ -796,5 +903,62 @@ impl<D: DnsProvider> CertProvider for DnsAcmeProvider<D> {
         });
 
         Ok(BackgroundGuard::new(cancel))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use super::*;
+
+    #[derive(Default)]
+    struct RecordingDns {
+        removed: Mutex<Vec<(String, String)>>,
+    }
+
+    #[async_trait]
+    impl DnsProvider for RecordingDns {
+        async fn add_txt_record(&self, _fqdn: &str, _value: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn remove_txt_record(&self, fqdn: &str, value: &str) -> Result<()> {
+            self.removed
+                .lock()
+                .unwrap()
+                .push((fqdn.to_owned(), value.to_owned()));
+            Ok(())
+        }
+    }
+
+    fn challenge() -> ChallengeInfo {
+        ChallengeInfo {
+            fqdn: "_acme-challenge.example.com".to_owned(),
+            dns_value: "challenge-value".to_owned(),
+        }
+    }
+
+    #[tokio::test]
+    async fn cleans_up_after_success() {
+        let dns = RecordingDns::default();
+        let result = finish_challenge_attempt(&dns, &[challenge()], Ok(())).await;
+
+        assert!(result.is_ok());
+        assert_eq!(dns.removed.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn cleans_up_after_failure_without_masking_it() {
+        let dns = RecordingDns::default();
+        let result: Result<()> = finish_challenge_attempt(
+            &dns,
+            &[challenge()],
+            Err(Error::Challenge("validation failed".to_owned())),
+        )
+        .await;
+
+        assert!(matches!(result, Err(Error::Challenge(_))));
+        assert_eq!(dns.removed.lock().unwrap().len(), 1);
     }
 }

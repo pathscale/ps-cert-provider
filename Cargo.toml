@@ -1,10 +1,10 @@
 [package]
-name = "cert-provider"
+name = "ps-cert-provider"
 version = "0.1.0"
 edition = "2021"
 description = "ACME certificate provisioning for Rust servers"
 license = "MIT OR Apache-2.0"
-# repository = "https://github.com/dveon-loch/cert-provider"
+repository = "https://github.com/pathscale/ps-cert-provider"
 
 [features]
 default = []                             # No default provider – user must enable one

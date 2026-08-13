@@ -237,37 +237,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cert-provider"
-version = "0.1.0"
-dependencies = [
- "acme-rfc8555",
- "async-trait",
- "aws-creds",
- "aws-region",
- "bytes",
- "futures",
- "http-body-util",
- "hyper",
- "hyper-rustls",
- "hyper-util",
- "instant-acme",
- "rcgen",
- "reqwest 0.12.28",
- "rust-s3",
- "rustls",
- "rustls-pemfile",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tokio-rustls-acme",
- "tokio-util",
- "tracing",
- "x509-parser 0.17.0",
-]
-
-[[package]]
 name = "cesu8"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1576,6 +1545,37 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8fd00f0bb2e90d81d1044c2b32617f68fcb9fa3bb7640c23e9c748e53fb30934"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "ps-cert-provider"
+version = "0.1.0"
+dependencies = [
+ "acme-rfc8555",
+ "async-trait",
+ "aws-creds",
+ "aws-region",
+ "bytes",
+ "futures",
+ "http-body-util",
+ "hyper",
+ "hyper-rustls",
+ "hyper-util",
+ "instant-acme",
+ "rcgen",
+ "reqwest 0.12.28",
+ "rust-s3",
+ "rustls",
+ "rustls-pemfile",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-rustls-acme",
+ "tokio-util",
+ "tracing",
+ "x509-parser 0.17.0",
 ]
 
 [[package]]
