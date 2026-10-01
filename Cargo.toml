@@ -1,6 +1,6 @@
 [package]
 name = "ps-cert-provider"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "ACME certificate provisioning for Rust servers"
 license = "MIT OR Apache-2.0"
@@ -8,17 +8,17 @@ repository = "https://github.com/pathscale/ps-cert-provider"
 
 [features]
 default = []                             # No default provider – user must enable one
-tokio-acme = ["dep:tokio-rustls-acme", "dep:rustls-pemfile", "dep:futures"]   # tokio-rustls-acme based impl
+tokio-acme = ["dep:tokio-rustls-acme", "dep:rustls-pemfile", "dep:futures", "dep:tokio", "dep:tokio-util"]   # tokio-rustls-acme based impl
 rfc8555 = ["dep:acme-rfc8555", "dep:reqwest", "dep:rcgen", "dep:rustls-pemfile", "dep:hyper", "dep:hyper-util", "dep:http-body-util"]   # acme-rfc8555 impl with HTTP-01 solving
-dns01 = ["dep:instant-acme", "dep:reqwest", "dep:serde", "dep:serde_json", "dep:rcgen", "dep:x509-parser", "dep:hyper-rustls", "dep:hyper-util", "dep:bytes"]   # DNS-01 challenge provider (bring-your-own DNS)
-s3-sync = ["dep:rust-s3", "dep:aws-creds", "dep:aws-region"]                   # S3 / R2 sync support for cert persistence
+dns01 = ["dep:nago-http", "dep:nagoya", "dep:ring", "dep:serde", "dep:serde_json", "dep:rcgen", "dep:x509-parser"]   # DNS-01 challenge provider (bring-your-own DNS)
+s3-sync = ["dep:rust-s3", "dep:aws-creds", "dep:aws-region", "dep:tokio", "dep:tokio-util"]                   # S3 / R2 sync support for cert persistence
 
 [dependencies]
 # Core
 async-trait = "0.1"
 thiserror = "2"
-tokio = { version = "1", features = ["full"] }
-tokio-util = { version = "0.7", features = ["rt"] }
+tokio = { version = "1", features = ["full"], optional = true }
+tokio-util = { version = "0.7", features = ["rt"], optional = true }
 tracing = "0.1"                        
 rustls-pemfile = { version = "2", optional = true }
 
@@ -37,12 +37,12 @@ http-body-util = { version = "0.1", optional = true }
 rustls = {version = "0.23.39", default-features = false}
 
 # dns01 provider
-instant-acme = { version = "0.8", optional = true, default-features = false, features = ["ring", "hyper-rustls", "rcgen"] }
-hyper-rustls = { version = "0.27", optional = true, default-features = false, features = ["webpki-tokio"] }
+nago-http = { version = "0.1", optional = true }
+nagoya = { version = "0.1", optional = true, features = ["reactor"] }
+ring = { version = "0.17", optional = true }
 serde = { version = "1", optional = true, features = ["derive"] }
 serde_json = { version = "1", optional = true }
 x509-parser = { version = "0.17", optional = true, default-features = false }
-bytes = { version = "1", optional = true }
 
 # S3 sync support
 rust-s3 = { version = "0.37", optional = true, default-features = false, features = ["tokio-rustls-tls", "fail-on-err", "tags"] }

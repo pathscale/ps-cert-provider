@@ -11,7 +11,7 @@ The crate guarantees that valid certificate and key files are present in a given
 - **Three backends** (selectable via Cargo features):
   - `tokio-acme` – backed by [`tokio-rustls-acme`], uses `TLS-ALPN-01` challenges. Requires port 443 to be publicly reachable.
   - `rfc8555` – backed by [`acme-rfc8555`], uses `HTTP-01` challenges. Requires port 80 to be publicly reachable.
-  - `dns01` – backed by [`instant-acme`], uses `DNS-01` challenges. Requires DNS API access (bring your own DNS provider impl).
+  - `dns01` – implements ACME over [`nago-http`] and uses `DNS-01` challenges. Requires DNS API access (bring your own DNS provider impl).
 - **S3 / R2 sync** (optional `s3-sync` feature) – pull certs from S3-compatible storage on startup, push after issuance, and periodically upload renewed certs.
 - **Uniform API** – all backends implement the `CertProvider` trait.
 - **Persistent caching** – ACME account keys and certs survive restarts, avoiding rate-limit issues.
@@ -32,6 +32,11 @@ cert-provider = { package = "ps-cert-provider", version = "0.1", features = ["dn
 # or (with S3 sync)
 cert-provider = { package = "ps-cert-provider", version = "0.1", features = ["dns01", "s3-sync"] }
 ```
+
+The `dns01` feature uses nagoya and nago-http and does not enable Tokio. Check
+the dependency tree with `cargo tree -e features -i tokio --features dns01`;
+it should be empty. The separate `s3-sync`, `tokio-acme`, and `rfc8555`
+features keep their own runtime dependencies.
 
 ---
 
@@ -200,7 +205,7 @@ primary_region = "lhr"
 
 DNS-01 uses domain control via DNS TXT records. Useful when you cannot expose port 443 or 80 (e.g., shared hosting, Fly.io without dedicated IPv4). Requires programmatic access to your DNS provider.
 
-The `dns01` feature requires you to implement the `DnsProvider` trait (add TXT / remove TXT records). A ready-made `BunnyDns` implementation for bunny.net DNS is included.
+You can implement the `DnsProvider` trait (add TXT / remove TXT records) for your DNS service. A ready-made `BunnyDns` implementation for bunny.net DNS is included.
 
 ```rust
 use std::path::PathBuf;
@@ -430,7 +435,7 @@ A decorator that wraps any `CertProvider` to sync cert files to/from S3.
 
 ## Error Handling
 
-All errors are `cert_provider::Error` variants: `Io`, `AcmeProtocol`, `Challenge`, `Config`, etc. The `Challenge` variant is returned when `init` times out waiting for Let's Encrypt to validate (default timeout: 5 minutes). Common causes: port not publicly reachable, DNS not pointing to the server, or firewall blocking inbound connections.
+All errors are `cert_provider::Error` variants: `Io`, `AcmeProtocol`, `Challenge`, `Config`, etc. The `Challenge` variant is returned when an ACME challenge or order becomes invalid. For DNS-01, the provider polls order state with increasing delays until the server returns a terminal state.
 
 ---
 
@@ -442,4 +447,4 @@ Licensed under either of [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE) at y
 
 [`tokio-rustls-acme`]: https://crates.io/crates/tokio-rustls-acme
 [`acme-rfc8555`]: https://crates.io/crates/acme-rfc8555
-[`instant-acme`]: https://crates.io/crates/instant-acme
+[`nago-http`]: https://crates.io/crates/nago-http
