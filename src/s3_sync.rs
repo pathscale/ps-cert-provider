@@ -10,7 +10,7 @@ use tokio_util::sync::CancellationToken;
 use crate::error::Result;
 use crate::provider::BackgroundGuard;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct S3Config {
     pub bucket_name: String,
     pub endpoint: String,
@@ -18,6 +18,19 @@ pub struct S3Config {
     pub secret_key: String,
     pub region: Option<String>,
     pub prefix: Option<String>,
+}
+
+impl std::fmt::Debug for S3Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("S3Config")
+            .field("bucket_name", &self.bucket_name)
+            .field("endpoint", &"<redacted>")
+            .field("access_key", &"<redacted>")
+            .field("secret_key", &"<redacted>")
+            .field("region", &self.region)
+            .field("prefix", &self.prefix)
+            .finish()
+    }
 }
 
 impl S3Config {
@@ -29,10 +42,18 @@ impl S3Config {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct S3CertSync {
     bucket: Arc<Box<Bucket>>,
     config: S3Config,
+}
+
+impl std::fmt::Debug for S3CertSync {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("S3CertSync")
+            .field("config", &self.config)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Default)]
@@ -71,8 +92,7 @@ impl S3CertSync {
             }
         };
 
-        let bucket = Bucket::new(&config.bucket_name, region, credentials)?
-            .with_path_style();
+        let bucket = Bucket::new(&config.bucket_name, region, credentials)?.with_path_style();
         Ok(bucket)
     }
 
@@ -188,5 +208,38 @@ pub fn env_config() -> S3Config {
         secret_key: std::env::var("CERT_S3_SECRET_KEY").unwrap_or_default(),
         region: std::env::var("CERT_S3_REGION").ok(),
         prefix: std::env::var("CERT_S3_PREFIX").ok(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{S3CertSync, S3Config};
+
+    fn config() -> S3Config {
+        S3Config {
+            bucket_name: "test-bucket".into(),
+            endpoint: "https://endpoint-secret.example.invalid".into(),
+            access_key: "access-key-secret-value".into(),
+            secret_key: "secret-key-secret-value".into(),
+            region: Some("test-region".into()),
+            prefix: Some("test-prefix".into()),
+        }
+    }
+
+    #[test]
+    fn s3_debug_output_redacts_credentials_and_endpoint() {
+        let config = config();
+        let sync = S3CertSync::new(config.clone()).expect("dummy S3 config is constructible");
+
+        for debug in [format!("{config:?}"), format!("{sync:?}")] {
+            for secret in [
+                "endpoint-secret.example.invalid",
+                "access-key-secret-value",
+                "secret-key-secret-value",
+            ] {
+                assert!(!debug.contains(secret), "debug output leaked {secret}");
+            }
+            assert!(debug.contains("<redacted>"));
+        }
     }
 }
