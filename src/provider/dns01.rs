@@ -23,6 +23,7 @@ use crate::error::{Error, Result};
 use crate::provider::{BackgroundGuard, CertProvider};
 #[cfg(feature = "s3-sync")]
 use crate::s3_sync::S3CertSync;
+use crate::secret_file::write_secret;
 
 const DEFAULT_PROPAGATION_SECS: u64 = 60;
 const DEFAULT_RENEW_WITHIN_DAYS: u64 = 30;
@@ -334,31 +335,88 @@ struct CachedCredentials {
     credentials: AccountCredentials,
 }
 
+const INVALID_CACHED_ACCOUNT: &str = "cached ACME account credentials are invalid; \
+     remove acme_account_credentials.json from the cache directory (with S3 sync, also \
+     delete the {prefix}/acme_cache/acme_account_credentials.json object) to register a new account";
+const RESTORE_ACCOUNT_UNREACHABLE: &str = "could not reach the ACME server to restore the cached \
+     ACME account; the cached credentials were kept, retry when the server is reachable";
+const READ_CACHED_ACCOUNT: &str = "failed to read cached ACME account credentials";
+const CHECK_CACHED_ACCOUNT: &str = "failed to check cached ACME account credentials";
+
+async fn read_cached_credentials(path: &Path) -> Result<Option<CachedCredentials>> {
+    let json = match tokio::fs::read_to_string(path).await {
+        Ok(json) => json,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match tokio::fs::symlink_metadata(path).await {
+                Ok(_) => return Err(Error::Account(INVALID_CACHED_ACCOUNT.into())),
+                Err(metadata_error) if metadata_error.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(None);
+                }
+                Err(metadata_error) => {
+                    return Err(Error::Io(std::io::Error::new(
+                        metadata_error.kind(),
+                        CHECK_CACHED_ACCOUNT,
+                    )));
+                }
+            }
+        }
+        Err(error) => {
+            return Err(Error::Io(std::io::Error::new(
+                error.kind(),
+                READ_CACHED_ACCOUNT,
+            )));
+        }
+    };
+
+    serde_json::from_str::<CachedCredentials>(&json)
+        .map(Some)
+        .map_err(|_| Error::Account(INVALID_CACHED_ACCOUNT.into()))
+}
+
 async fn load_or_create_account(
     cache_dir: &Path,
     email: &str,
     production: bool,
 ) -> Result<Account> {
+    load_or_create_account_with_http(cache_dir, email, production, make_http_client).await
+}
+
+async fn load_or_create_account_with_http<F>(
+    cache_dir: &Path,
+    email: &str,
+    production: bool,
+    http_factory: F,
+) -> Result<Account>
+where
+    F: Fn() -> Result<Box<dyn HttpClient>>,
+{
     let creds_path = cache_dir.join("acme_account_credentials.json");
 
-    if creds_path.exists() {
-        let json = tokio::fs::read_to_string(&creds_path).await?;
-        if let Ok(cached) = serde_json::from_str::<CachedCredentials>(&json) {
-            let http = make_http_client()?;
-            let builder = Account::builder_with_http(http);
-            match builder.from_credentials(cached.credentials).await {
-                Ok(account) => {
-                    info!("Loaded ACME account from cache");
-                    return Ok(account);
-                }
-                Err(e) => {
-                    warn!("Cached ACME credentials invalid ({e}), creating new account");
-                }
+    if let Some(cached) = read_cached_credentials(&creds_path).await? {
+        let http = http_factory()?;
+        let builder = Account::builder_with_http(http);
+        match builder.from_credentials(cached.credentials).await {
+            Ok(account) => {
+                info!("Loaded ACME account from cache");
+                return Ok(account);
+            }
+            Err(error) => {
+                warn!(error = %error, "Failed to restore ACME account from cached credentials");
+                // `from_credentials` only parses the key and fetches the directory; it does
+                // not look the account up, so a deactivated or unknown account is not
+                // detected here. The `Api(_)` arm is defensive.
+                let message = match error {
+                    instant_acme::Error::Api(_)
+                    | instant_acme::Error::KeyRejected
+                    | instant_acme::Error::Str(_) => INVALID_CACHED_ACCOUNT,
+                    _ => RESTORE_ACCOUNT_UNREACHABLE,
+                };
+                return Err(Error::Account(message.into()));
             }
         }
     }
 
-    let http = make_http_client()?;
+    let http = http_factory()?;
     let builder = Account::builder_with_http(http);
 
     let contact = format!("mailto:{email}");
@@ -381,7 +439,7 @@ async fn load_or_create_account(
     let cached = CachedCredentials { credentials };
     let json = serde_json::to_string_pretty(&cached)
         .map_err(|e| Error::Config(format!("serialize account credentials: {e}")))?;
-    tokio::fs::write(&creds_path, json).await?;
+    write_secret(&creds_path, json.as_bytes()).await?;
     info!("Created and cached new ACME account");
     Ok(account)
 }
@@ -613,7 +671,7 @@ async fn issue_certificate_inner<D: DnsProvider>(
     let fullchain_path = cert_dir.join("fullchain.pem");
     let privkey_path = cert_dir.join("privkey.pem");
     tokio::fs::write(&fullchain_path, &cert_pem).await?;
-    tokio::fs::write(&privkey_path, &key_pem).await?;
+    write_secret(&privkey_path, &key_pem).await?;
     info!("DNS-01 certificate written to {:?}", cert_dir);
 
     Ok(())
@@ -747,6 +805,11 @@ impl<D: DnsProvider> CertProvider for DnsAcmeProvider<D> {
         tokio::fs::create_dir_all(&cert_dir).await?;
         let cache_dir = cert_dir.join("acme_cache");
         tokio::fs::create_dir_all(&cache_dir).await?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            tokio::fs::set_permissions(&cache_dir, std::fs::Permissions::from_mode(0o700)).await?;
+        }
 
         let fullchain_path = cert_dir.join("fullchain.pem");
         let privkey_path = cert_dir.join("privkey.pem");
@@ -860,7 +923,7 @@ impl<D: DnsProvider> CertProvider for DnsAcmeProvider<D> {
                     match load_or_create_account(&bg_cache_dir, &contact_email, production).await {
                         Ok(a) => a,
                         Err(e) => {
-                            tracing::debug!(
+                            warn!(
                                 "Renewal: account load failed ({e}), retrying in {:?}",
                                 retry_delay
                             );
@@ -908,9 +971,134 @@ impl<D: DnsProvider> CertProvider for DnsAcmeProvider<D> {
 
 #[cfg(test)]
 mod tests {
+    use std::future::Future;
+    use std::pin::Pin;
     use std::sync::Mutex;
 
     use super::*;
+    use http::{header::LOCATION, Method, Request, Response, StatusCode};
+    use instant_acme::{BytesResponse, HttpClient};
+
+    const FAKE_DIRECTORY_BODY: &[u8] = br#"{
+        "newNonce":"/new-nonce",
+        "newAccount":"/new-account",
+        "newOrder":"/new-order"
+    }"#;
+
+    #[derive(Clone)]
+    struct FakeHttp {
+        directory_url: String,
+        account_url: String,
+        requests: Arc<Mutex<Vec<(Method, String)>>>,
+        fail_directory: bool,
+    }
+
+    impl HttpClient for FakeHttp {
+        fn request(
+            &self,
+            request: Request<BodyWrapper<bytes::Bytes>>,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = std::result::Result<BytesResponse, instant_acme::Error>> + Send,
+            >,
+        > {
+            let directory_url = self.directory_url.clone();
+            let account_url = self.account_url.clone();
+            let requests = self.requests.clone();
+            let fail_directory = self.fail_directory;
+            Box::pin(async move {
+                let method = request.method().clone();
+                let url = request.uri().to_string();
+                requests.lock().unwrap().push((method.clone(), url.clone()));
+
+                let fail_this_directory_request = fail_directory
+                    && requests
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|(_, previous_url)| previous_url == &directory_url)
+                        .count()
+                        == 1;
+                if url == directory_url && fail_this_directory_request {
+                    return Err(instant_acme::Error::Other("restore-sentinel".into()));
+                }
+
+                let mut response = if url == directory_url {
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .body(bytes::Bytes::from_static(FAKE_DIRECTORY_BODY))
+                        .unwrap()
+                } else if url.ends_with("/new-nonce") && method == Method::HEAD {
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header("Replay-Nonce", "fake-nonce")
+                        .body(bytes::Bytes::new())
+                        .unwrap()
+                } else if url.ends_with("/new-account") && method == Method::POST {
+                    Response::builder()
+                        .status(StatusCode::CREATED)
+                        .header(LOCATION, account_url)
+                        .body(bytes::Bytes::new())
+                        .unwrap()
+                } else {
+                    return Err("unplanned fake ACME request".into());
+                };
+                let (parts, body) = response.into_parts();
+                Ok(BytesResponse {
+                    parts,
+                    body: Box::new(body),
+                })
+            })
+        }
+    }
+
+    fn fake_http(
+        directory_url: &str,
+        account_url: &str,
+        requests: Arc<Mutex<Vec<(Method, String)>>>,
+        fail_directory: bool,
+    ) -> Box<dyn HttpClient> {
+        Box::new(FakeHttp {
+            directory_url: directory_url.to_owned(),
+            account_url: account_url.to_owned(),
+            requests,
+            fail_directory,
+        })
+    }
+
+    fn registrations(requests: &[(Method, String)]) -> usize {
+        requests
+            .iter()
+            .filter(|(method, url)| method == Method::POST && url.ends_with("/new-account"))
+            .count()
+    }
+
+    async fn legacy_cache_fixture(path: &Path, directory_url: &str) -> (String, Vec<u8>) {
+        let account_url = "https://legacy.invalid/account/known";
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let contact = ["mailto:legacy@example.invalid"];
+        let (_, credentials) = Account::builder_with_http(fake_http(
+            directory_url,
+            account_url,
+            requests.clone(),
+            false,
+        ))
+        .create(
+            &NewAccount {
+                contact: &contact,
+                terms_of_service_agreed: true,
+                only_return_existing: false,
+            },
+            directory_url.to_owned(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(registrations(&requests.lock().unwrap()), 1);
+        let bytes = serde_json::to_vec(&serde_json::json!({ "credentials": credentials })).unwrap();
+        std::fs::write(path, &bytes).unwrap();
+        (account_url.to_owned(), bytes)
+    }
 
     #[derive(Default)]
     struct RecordingDns {
@@ -937,6 +1125,334 @@ mod tests {
             fqdn: "_acme-challenge.example.com".to_owned(),
             dns_value: "challenge-value".to_owned(),
         }
+    }
+
+    #[tokio::test]
+    async fn legacy_cache_restores_same_account_twice() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("acme_account_credentials.json");
+        let directory_url = LetsEncrypt::Staging.url();
+        let (account_url, original) = legacy_cache_fixture(&path, directory_url).await;
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let factory_requests = requests.clone();
+        let first = load_or_create_account_with_http(
+            dir.path(),
+            "cache@example.invalid",
+            false,
+            move || {
+                Ok(fake_http(
+                    directory_url,
+                    "https://fallback.invalid/account/unexpected",
+                    factory_requests.clone(),
+                    false,
+                ))
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.id(), account_url);
+
+        let factory_requests = requests.clone();
+        let second = load_or_create_account_with_http(
+            dir.path(),
+            "cache@example.invalid",
+            false,
+            move || {
+                Ok(fake_http(
+                    directory_url,
+                    "https://fallback.invalid/account/unexpected",
+                    factory_requests.clone(),
+                    false,
+                ))
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(second.id(), account_url);
+        let recorded = requests.lock().unwrap();
+        assert_eq!(registrations(&recorded), 0);
+        assert_eq!(std::fs::read(path).unwrap(), original);
+        assert_eq!(
+            recorded
+                .iter()
+                .filter(|(_, url)| url == directory_url)
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_error_preserves_cache_without_registering() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("acme_account_credentials.json");
+        let directory_url = LetsEncrypt::Staging.url();
+        let (_, original) = legacy_cache_fixture(&path, directory_url).await;
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let factory_requests = requests.clone();
+        let result = load_or_create_account_with_http(
+            dir.path(),
+            "cache@example.invalid",
+            false,
+            move || {
+                Ok(fake_http(
+                    directory_url,
+                    "https://fallback.invalid/account/unexpected",
+                    factory_requests.clone(),
+                    true,
+                ))
+            },
+        )
+        .await;
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("restore unexpectedly succeeded"),
+        };
+
+        assert!(
+            matches!(&error, Error::Account(message) if message == RESTORE_ACCOUNT_UNREACHABLE)
+        );
+        assert!(!error.to_string().contains("restore-sentinel"));
+        let recorded = requests.lock().unwrap();
+        assert_eq!(
+            recorded.len(),
+            1,
+            "restore must not attempt any fallback request"
+        );
+        assert_eq!(registrations(&recorded), 0);
+        assert_eq!(
+            recorded
+                .iter()
+                .filter(|(_, url)| url == directory_url)
+                .count(),
+            1
+        );
+        assert_eq!(std::fs::read(path).unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn absent_cache_registers_once_then_restores_published_account() {
+        let dir = tempfile::tempdir().unwrap();
+        let directory_url = LetsEncrypt::Staging.url();
+        let account_url = "https://acme.invalid/account/cold-start";
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let factory_requests = requests.clone();
+        let first = load_or_create_account_with_http(
+            dir.path(),
+            "cache@example.invalid",
+            false,
+            move || {
+                Ok(fake_http(
+                    directory_url,
+                    account_url,
+                    factory_requests.clone(),
+                    false,
+                ))
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.id(), account_url);
+        let path = dir.path().join("acme_account_credentials.json");
+        let published = std::fs::read(&path).unwrap();
+        let envelope: CachedCredentials = serde_json::from_slice(&published).unwrap();
+        let _ = envelope;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        assert_eq!(registrations(&requests.lock().unwrap()), 1);
+
+        let factory_requests = requests.clone();
+        let second = load_or_create_account_with_http(
+            dir.path(),
+            "cache@example.invalid",
+            false,
+            move || {
+                Ok(fake_http(
+                    directory_url,
+                    "https://fallback.invalid/account/unexpected",
+                    factory_requests.clone(),
+                    false,
+                ))
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(second.id(), account_url);
+        assert_eq!(registrations(&requests.lock().unwrap()), 1);
+        assert_eq!(std::fs::read(path).unwrap(), published);
+    }
+
+    #[tokio::test]
+    async fn unusable_cache_entries_never_register() {
+        let directory_url = LetsEncrypt::Staging.url();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+
+        let malformed_dir = tempfile::tempdir().unwrap();
+        let malformed_path = malformed_dir.path().join("acme_account_credentials.json");
+        let malformed_bytes = b"invalid-cache-sentinel";
+        std::fs::write(&malformed_path, malformed_bytes).unwrap();
+        let factory_requests = requests.clone();
+        let malformed_error = load_or_create_account_with_http(
+            malformed_dir.path(),
+            "cache@example.invalid",
+            false,
+            move || {
+                Ok(fake_http(
+                    directory_url,
+                    "https://fallback.invalid/account/unexpected",
+                    factory_requests.clone(),
+                    false,
+                ))
+            },
+        )
+        .await
+        .err()
+        .expect("malformed cache should fail closed");
+        assert!(
+            matches!(&malformed_error, Error::Account(message) if message == INVALID_CACHED_ACCOUNT)
+        );
+        assert!(!malformed_error
+            .to_string()
+            .contains("invalid-cache-sentinel"));
+        assert_eq!(std::fs::read(&malformed_path).unwrap(), malformed_bytes);
+
+        let directory_dir = tempfile::tempdir().unwrap();
+        let directory_path = directory_dir.path().join("acme_account_credentials.json");
+        std::fs::create_dir(&directory_path).unwrap();
+        std::fs::write(directory_path.join("keep"), b"intact").unwrap();
+        let direct_read_error = std::fs::read(&directory_path).unwrap_err();
+        let factory_requests = requests.clone();
+        let directory_error = load_or_create_account_with_http(
+            directory_dir.path(),
+            "cache@example.invalid",
+            false,
+            move || {
+                Ok(fake_http(
+                    directory_url,
+                    "https://fallback.invalid/account/unexpected",
+                    factory_requests.clone(),
+                    false,
+                ))
+            },
+        )
+        .await
+        .err()
+        .expect("directory cache entry should fail closed");
+        assert!(matches!(
+            &directory_error,
+            Error::Io(error) if error.kind() == direct_read_error.kind()
+        ));
+        assert_eq!(
+            directory_error.to_string(),
+            format!("I/O error: {READ_CACHED_ACCOUNT}")
+        );
+        assert_eq!(
+            std::fs::read(directory_path.join("keep")).unwrap(),
+            b"intact"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let link_dir = tempfile::tempdir().unwrap();
+            let link_path = link_dir.path().join("acme_account_credentials.json");
+            let target = link_dir.path().join("missing-target");
+            symlink(&target, &link_path).unwrap();
+            let factory_requests = requests.clone();
+            let link_error = load_or_create_account_with_http(
+                link_dir.path(),
+                "cache@example.invalid",
+                false,
+                move || {
+                    Ok(fake_http(
+                        directory_url,
+                        "https://fallback.invalid/account/unexpected",
+                        factory_requests.clone(),
+                        false,
+                    ))
+                },
+            )
+            .await
+            .err()
+            .expect("dangling link should fail closed");
+            assert!(
+                matches!(link_error, Error::Account(message) if message == INVALID_CACHED_ACCOUNT)
+            );
+            assert_eq!(std::fs::read_link(&link_path).unwrap(), target);
+        }
+
+        let recorded = requests.lock().unwrap();
+        assert_eq!(recorded.len(), 0);
+        assert_eq!(registrations(&recorded), 0);
+    }
+
+    #[tokio::test]
+    async fn missing_account_entry_is_the_only_registration_case() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("acme_account_credentials.json");
+
+        assert!(read_cached_credentials(&path).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn malformed_account_entry_fails_closed_without_changing_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("acme_account_credentials.json");
+        let original = b"not account json";
+        std::fs::write(&path, original).unwrap();
+
+        let error = match read_cached_credentials(&path).await {
+            Err(error) => error,
+            Ok(_) => panic!("malformed credentials unexpectedly loaded"),
+        };
+        assert!(matches!(error, Error::Account(message) if message == INVALID_CACHED_ACCOUNT));
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dangling_account_symlink_fails_closed_without_changing_link() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("acme_account_credentials.json");
+        let target = dir.path().join("missing-target");
+        symlink(&target, &path).unwrap();
+
+        let error = match read_cached_credentials(&path).await {
+            Err(error) => error,
+            Ok(_) => panic!("dangling credential symlink unexpectedly loaded"),
+        };
+        assert!(matches!(error, Error::Account(message) if message == INVALID_CACHED_ACCOUNT));
+        assert_eq!(std::fs::read_link(&path).unwrap(), target);
+    }
+
+    #[tokio::test]
+    async fn account_read_io_failure_preserves_error_kind_and_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("acme_account_credentials.json");
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("keep"), b"intact").unwrap();
+        let direct_read_error = std::fs::read(&path).unwrap_err();
+
+        let error = match read_cached_credentials(&path).await {
+            Err(error) => error,
+            Ok(_) => panic!("credential directory unexpectedly loaded"),
+        };
+        assert!(matches!(
+            &error,
+            Error::Io(error) if error.kind() == direct_read_error.kind()
+        ));
+        assert_eq!(
+            error.to_string(),
+            format!("I/O error: {READ_CACHED_ACCOUNT}")
+        );
+        assert_eq!(std::fs::read(path.join("keep")).unwrap(), b"intact");
     }
 
     #[tokio::test]

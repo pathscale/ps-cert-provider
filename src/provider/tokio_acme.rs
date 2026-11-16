@@ -5,16 +5,16 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use futures::TryStreamExt;
 use futures::stream::Stream;
+use futures::TryStreamExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Notify;
-use tokio_rustls_acme::{AccountCache, AcmeConfig, CertCache, caches::DirCache};
+use tokio_rustls_acme::{caches::DirCache, AccountCache, AcmeConfig, CertCache};
 use tokio_util::sync::CancellationToken;
 
-
 use crate::error::{Error, Result};
-use crate::provider::{CertProvider, BackgroundGuard};
+use crate::provider::{BackgroundGuard, CertProvider};
+use crate::secret_file::write_secret;
 
 const CHALLENGE_TIMEOUT_SECS: u64 = 5 * 60;
 
@@ -52,7 +52,11 @@ struct PemWritingCache {
 
 impl PemWritingCache {
     fn new(cache_dir: PathBuf, cert_dir: PathBuf, cert_ready: Arc<Notify>) -> Self {
-        Self { dir_cache: DirCache::new(cache_dir), cert_dir, cert_ready }
+        Self {
+            dir_cache: DirCache::new(cache_dir),
+            cert_dir,
+            cert_ready,
+        }
     }
 
     async fn write_pem_files(&self, pem: &[u8]) -> std::io::Result<()> {
@@ -62,7 +66,7 @@ impl PemWritingCache {
                 "ACME cert PEM did not contain a CERTIFICATE block",
             )
         })?;
-        tokio::fs::write(self.cert_dir.join("privkey.pem"), privkey).await?;
+        write_secret(&self.cert_dir.join("privkey.pem"), &privkey).await?;
         tokio::fs::write(self.cert_dir.join("fullchain.pem"), chain).await?;
         Ok(())
     }
@@ -92,7 +96,9 @@ impl CertCache for PemWritingCache {
         directory_url: &str,
         cert: &[u8],
     ) -> std::result::Result<(), Self::EC> {
-        self.dir_cache.store_cert(domains, directory_url, cert).await?;
+        self.dir_cache
+            .store_cert(domains, directory_url, cert)
+            .await?;
         self.write_pem_files(cert).await?;
         self.cert_ready.notify_one();
         Ok(())
@@ -117,7 +123,9 @@ impl AccountCache for PemWritingCache {
         directory_url: &str,
         account: &[u8],
     ) -> std::result::Result<(), Self::EA> {
-        self.dir_cache.store_account(contact, directory_url, account).await
+        self.dir_cache
+            .store_account(contact, directory_url, account)
+            .await
     }
 }
 
@@ -131,6 +139,59 @@ fn split_pem(pem: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
     let privkey = text[..chain_start].trim_end().as_bytes().to_vec();
     let chain = text[chain_start..].as_bytes().to_vec();
     Some((privkey, chain))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PemWritingCache;
+    use std::sync::Arc;
+    use tokio::sync::Notify;
+
+    #[tokio::test]
+    async fn pem_export_keeps_chain_and_restricts_private_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = PemWritingCache::new(
+            dir.path().join("cache"),
+            dir.path().to_owned(),
+            Arc::new(Notify::new()),
+        );
+        let key_path = dir.path().join("privkey.pem");
+        tokio::fs::write(&key_path, b"stale-key").await.unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            tokio::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o644))
+                .await
+                .unwrap();
+        }
+        let pem = b"-----BEGIN PRIVATE KEY-----\nsynthetic-key\n-----END PRIVATE KEY-----\n-----BEGIN CERTIFICATE-----\nsynthetic-cert\n-----END CERTIFICATE-----\n";
+        cache.write_pem_files(pem).await.unwrap();
+        assert_eq!(
+            tokio::fs::read(dir.path().join("privkey.pem"))
+                .await
+                .unwrap(),
+            b"-----BEGIN PRIVATE KEY-----\nsynthetic-key\n-----END PRIVATE KEY-----"
+        );
+        assert_eq!(
+            tokio::fs::read(dir.path().join("fullchain.pem"))
+                .await
+                .unwrap(),
+            b"-----BEGIN CERTIFICATE-----\nsynthetic-cert\n-----END CERTIFICATE-----\n"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                tokio::fs::metadata(dir.path().join("privkey.pem"))
+                    .await
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -202,6 +263,11 @@ impl CertProvider for TokioAcmeProvider {
         tokio::fs::create_dir_all(&cert_dir).await?;
         let cache_dir = cert_dir.join("acme_cache");
         tokio::fs::create_dir_all(&cache_dir).await?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            tokio::fs::set_permissions(&cache_dir, std::fs::Permissions::from_mode(0o700)).await?;
+        }
 
         // The notify fires as soon as a cert is available (cached or freshly issued).
         let cert_ready = Arc::new(Notify::new());
@@ -212,13 +278,15 @@ impl CertProvider for TokioAcmeProvider {
             .directory_lets_encrypt(self.production)
             .cache_with_boxed_err(cache);
 
-        let listener = TcpListener::bind(("0.0.0.0", self.port)).await.map_err(|e| {
-            Error::Config(format!(
-                "ACME: failed to bind 0.0.0.0:{}: {}. \
+        let listener = TcpListener::bind(("0.0.0.0", self.port))
+            .await
+            .map_err(|e| {
+                Error::Config(format!(
+                    "ACME: failed to bind 0.0.0.0:{}: {}. \
                  Ensure the port is not already in use and the process has permission.",
-                self.port, e
-            ))
-        })?;
+                    self.port, e
+                ))
+            })?;
         tracing::debug!("ACME TLS-ALPN-01 listener bound on 0.0.0.0:{}", self.port);
 
         let stream = ListenerStream { listener };

@@ -24,13 +24,13 @@ The crate guarantees that valid certificate and key files are present in a given
 
 ```toml
 [dependencies]
-cert-provider = { package = "ps-cert-provider", version = "0.1", features = ["tokio-acme"] }
+cert-provider = { package = "ps-cert-provider", version = "0.2", features = ["tokio-acme"] }
 # or
-cert-provider = { package = "ps-cert-provider", version = "0.1", features = ["rfc8555"] }
+cert-provider = { package = "ps-cert-provider", version = "0.2", features = ["rfc8555"] }
 # or
-cert-provider = { package = "ps-cert-provider", version = "0.1", features = ["dns01"] }
+cert-provider = { package = "ps-cert-provider", version = "0.2", features = ["dns01"] }
 # or (with S3 sync)
-cert-provider = { package = "ps-cert-provider", version = "0.1", features = ["dns01", "s3-sync"] }
+cert-provider = { package = "ps-cert-provider", version = "0.2", features = ["dns01", "s3-sync"] }
 ```
 
 ---
@@ -289,8 +289,8 @@ let sync = S3CertSync::new(S3Config {
     prefix:      Some("certs".into()),          // optional key prefix
 })?;
 
-sync.pull_to(&cert_dir).await?;   // download fullchain.pem + privkey.pem
-sync.push_from(&cert_dir).await?; // upload fullchain.pem + privkey.pem
+sync.pull_to(&cert_dir).await?;   // download fullchain.pem + privkey.pem + ACME account credentials
+sync.push_from(&cert_dir).await?; // upload fullchain.pem + privkey.pem + ACME account credentials
 
 // Periodic background sync for renewals:
 let _bg = sync.start_background_sync(cert_dir, Duration::from_secs(300));
@@ -318,6 +318,13 @@ let _guard = provider.init(cert_dir, Some(domains)).await?;
 // On drop: background sync and ACME renewal are both cancelled.
 ```
 
+### Startup failures (changed in 0.2.0)
+
+- `pull_to` returns an error, and `S3CertProvider::init` stops, when an S3 GET fails with any status other than 404 or with a transport error. Before 0.2.0 such failures were skipped.
+- `fullchain.pem` and `privkey.pem` are only written locally when both exist in S3. A lone object does not overwrite local files.
+- A cached ACME account that cannot be used (for example a malformed or unreadable `acme_account_credentials.json`, or a private key in it that cannot be parsed) is an error instead of a silent re-registration. To register a new account, delete `acme_cache/acme_account_credentials.json` in the cert directory and, with S3 sync, also the `{prefix}/acme_cache/acme_account_credentials.json` object. Otherwise the next `pull_to` restores the old copy.
+- If the ACME server cannot be reached while the cached account is being restored, init fails with a separate error and keeps the cached credentials. Retry once the server is reachable; do not delete the account.
+
 ### Environment variable helper
 
 ```rust
@@ -337,7 +344,7 @@ let s3_config = env_config(); // reads CERT_S3_* vars
 
 ### S3 key convention
 
-Cert files are stored at `{prefix}/fullchain.pem` and `{prefix}/privkey.pem`. Simple and predictable for manual inspection or access from other tools.
+Cert files are stored at `{prefix}/fullchain.pem` and `{prefix}/privkey.pem`, and the ACME account credentials at `{prefix}/acme_cache/acme_account_credentials.json`. Simple and predictable for manual inspection or access from other tools.
 
 ### Usage with ws-echo example
 
