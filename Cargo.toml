@@ -1,6 +1,6 @@
 [package]
 name = "ps-cert-provider"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "ACME certificate provisioning for Rust servers"
 license = "MIT OR Apache-2.0"
@@ -8,10 +8,10 @@ repository = "https://github.com/pathscale/ps-cert-provider"
 
 [features]
 default = []                             # No default provider – user must enable one
-tokio-acme = ["dep:tokio-rustls-acme", "dep:rustls-pemfile", "dep:futures"]   # tokio-rustls-acme based impl
+tokio-acme = ["dep:tokio-rustls-acme", "dep:rustls-pemfile", "dep:futures", "dep:tempfile"]   # tokio-rustls-acme based impl
 rfc8555 = ["dep:acme-rfc8555", "dep:reqwest", "dep:rcgen", "dep:rustls-pemfile", "dep:hyper", "dep:hyper-util", "dep:http-body-util"]   # acme-rfc8555 impl with HTTP-01 solving
-dns01 = ["dep:instant-acme", "dep:reqwest", "dep:serde", "dep:serde_json", "dep:rcgen", "dep:x509-parser", "dep:hyper-rustls", "dep:hyper-util", "dep:bytes"]   # DNS-01 challenge provider (bring-your-own DNS)
-s3-sync = ["dep:rust-s3", "dep:aws-creds", "dep:aws-region"]                   # S3 / R2 sync support for cert persistence
+dns01 = ["dep:instant-acme", "dep:reqwest", "dep:serde", "dep:serde_json", "dep:rcgen", "dep:x509-parser", "dep:hyper-rustls", "dep:hyper-util", "dep:bytes", "dep:tempfile"]   # DNS-01 challenge provider (bring-your-own DNS)
+s3-sync = ["dep:rust-s3", "dep:aws-creds", "dep:aws-region", "dep:tempfile"]                   # S3 / R2 sync support for cert persistence
 
 [dependencies]
 # Core
@@ -44,13 +44,17 @@ serde_json = { version = "1", optional = true }
 x509-parser = { version = "0.17", optional = true, default-features = false }
 bytes = { version = "1", optional = true }
 
+# Shared atomic secret-file writer
+tempfile = { version = "3", optional = true }
+
 # S3 sync support
 rust-s3 = { version = "0.37", optional = true, default-features = false, features = ["tokio-rustls-tls", "fail-on-err", "tags"] }
 aws-creds = { version = "0.39", optional = true, default-features = false, features = ["rustls-tls"] }
 aws-region = { version = "0.28", optional = true }
 
 [dev-dependencies]
-tempfile = "3"                          # for testing with temporary directories
+http = "1"
+tempfile = "3"
 
 [lib]
 name = "cert_provider"
